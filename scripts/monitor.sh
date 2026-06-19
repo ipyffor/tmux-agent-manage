@@ -81,14 +81,14 @@ t select-pane -t "$MONITOR_PANE" 2>/dev/null || true
 
 FZF_SOCK="$STATE_DIR/fzf.sock"
 
-# Start background reload loop (sends reload actions via Unix socket)
+# Start background reload loop (sends reload actions via Unix socket HTTP POST)
 (
     while true; do
         sleep "$INTERVAL"
         active=$(t display-message -t "$MONITOR_PANE" -p '#{pane_active}' 2>/dev/null || echo "0")
         if [ "$active" = "1" ]; then
             reload_cmd="reload($REFRESH_SCRIPT '$SCOPE' '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')"
-            printf '%s\n' "$reload_cmd" | socat - "UNIX-CONNECT:$FZF_SOCK" 2>/dev/null || true
+            curl -s --unix-socket "$FZF_SOCK" http -d "$reload_cmd" >/dev/null 2>&1 || true
         fi
     done
 ) &

@@ -6,10 +6,10 @@ Monitor Claude AI agents running across tmux panes — real-time status, live pr
 
 - tmux >= 3.2 (for `split-window -PF`)
 - fzf >= 0.48 (for `--listen` Unix socket API)
-- jq, perl, socat
+- jq, perl, curl
 
 ```bash
-sudo apt install fzf jq perl socat
+sudo apt install fzf jq perl curl
 ```
 
 ## Install (TPM)

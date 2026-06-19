@@ -25,7 +25,7 @@ get_opt() {
 
 require_deps() {
     local missing=()
-    for dep in fzf jq perl socat; do
+    for dep in fzf jq perl curl; do
         command -v "$dep" &>/dev/null || missing+=("$dep")
     done
     if [ ${#missing[@]} -gt 0 ]; then
