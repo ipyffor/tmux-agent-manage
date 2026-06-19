@@ -1,81 +1,134 @@
 #!/usr/bin/env bash
-# monitor.sh — fzf list + live preview + switch
-# Usage: monitor.sh [all|current]
+# monitor.sh — Main entry point: creates fzf+preview monitor window
+# Args: scope (all|current)
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/helpers.sh"
 
-# If launched via run-shell (no TTY), re-launch in a new tmux window
-if [ ! -t 0 ]; then
-    exec /usr/bin/tmux new-window "$0" "$@"
+# ── Re-exec in new window if not in a TTY ──────────────
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    exec "$TMUX_BIN" "${TMUX_SOCKET_ARGS[@]}" new-window -n "agent-monitor" "$(CDPATH= cd "$(dirname "$0")" && pwd)/monitor.sh" "$@"
 fi
 
-source "$SCRIPT_DIR/helpers.sh"
 require_deps
+ensure_state_dir
+
+# ── Args ────────────────────────────────────────────────
 
 SCOPE="${1:-all}"
-CUR_SESSION=""
+SESSION_NAME=""
 if [ "$SCOPE" = "current" ]; then
-    CUR_SESSION="$(/usr/bin/tmux display -p '#{session_name}' 2>/dev/null)"
+    SESSION_NAME=$(t display-message -p '#{session_name}' 2>/dev/null || echo "")
 fi
+
+# ── Config ──────────────────────────────────────────────
 
 INTERVAL=$(get_opt "@agent-monitor-refresh-interval" "2")
-FZF_EXTRA=$(get_opt "@agent-monitor-fzf-args" "")
+PREVIEW_POS=$(get_opt "@agent-monitor-preview-position" "down")
+PREVIEW_RATIO=$(get_opt "@agent-monitor-preview-ratio" "50")
+SCROLL_STEP=$(get_opt "@agent-monitor-scroll-step" "1")
+FZF_ARGS=$(get_opt "@agent-monitor-fzf-args" "")
 
-RELOAD_CMD="bash -c \"source $SCRIPT_DIR/helpers.sh && $SCRIPT_DIR/scanner.sh $SCOPE $CUR_SESSION | format_stream\""
+MONITOR_PANE="${TMUX_PANE:-}"
+if [ -z "$MONITOR_PANE" ]; then
+    echo "ERROR: monitor.sh must run inside a tmux pane" >&2
+    exit 1
+fi
+MONITOR_WINDOW=$(t display-message -p '#{window_id}' 2>/dev/null || echo "")
 
-# Initial data
-INIT_DATA=$("$SCRIPT_DIR/scanner.sh" "$SCOPE" "$CUR_SESSION" | format_stream)
-if [ -z "$INIT_DATA" ]; then
-    echo "No agents running. Press enter to exit."
-    read -r
-    exit 0
+# ── State files ─────────────────────────────────────────
+
+echo "0" > "$STATE_DIR/offset_x"
+echo "0" > "$STATE_DIR/offset_y"
+echo ""  > "$STATE_DIR/current"
+
+# ── Split window ────────────────────────────────────────
+# Default: vertical split (top=fzf, bottom=preview)
+
+if [ "$PREVIEW_POS" = "right" ]; then
+    SPLIT_FLAG="-h"
+else
+    SPLIT_FLAG="-v"
 fi
 
-MONITOR_PANE="$(/usr/bin/tmux display -p '#{pane_id}' 2>/dev/null)"
-FZF_PORT=$((50000 + RANDOM % 15000))
+# -PF captures the new pane_id created by split-window (tmux 3.2+)
+# Pass TMUX_SOCKET into the preview pane so its `t` wrapper hits the same server.
+SPLIT_ENV=(-e "STATE_DIR=$STATE_DIR" -e "TMUX_BIN=$TMUX_BIN")
+[ -n "${TMUX_SOCKET:-}" ] && SPLIT_ENV+=(-e "TMUX_SOCKET=$TMUX_SOCKET")
+PREVIEW_PANE=$(t split-window $SPLIT_FLAG -p "$PREVIEW_RATIO" -PF '#{pane_id}' \
+    "${SPLIT_ENV[@]}" \
+    "exec $SCRIPT_DIR/preview.sh" 2>/dev/null || echo "")
 
+# ── Refresh feed script ─────────────────────────────────
+
+REFRESH_SCRIPT="$SCRIPT_DIR/refresh-feed.sh"
+
+# Initial data
+INITIAL_DATA=$("$REFRESH_SCRIPT" "$SCOPE" "$SESSION_NAME" "$MONITOR_PANE" 2>/dev/null || true)
+
+# Pre-fill preview with first real agent so it's not blank on startup
+FIRST_PANE_ID=$(echo "$INITIAL_DATA" | grep -v '__empty__' | head -1 | cut -f1 2>/dev/null || echo "")
+if [ -n "$FIRST_PANE_ID" ] && [ "$FIRST_PANE_ID" != "__empty__" ]; then
+    echo "$FIRST_PANE_ID" > "$STATE_DIR/current"
+fi
+
+# Return focus to fzf pane (split-window gave it to preview)
+t select-pane -t "$MONITOR_PANE" 2>/dev/null || true
+
+# ── Periodic refresh via fzf --listen Unix socket ───────
+
+FZF_SOCK="$STATE_DIR/fzf.sock"
+
+# Start background reload loop (sends reload actions via Unix socket)
 (
-    # Background reload loop
-    (
-        last_struct=""
-        cycle=0
-        while true; do
-            sleep "$INTERVAL"
-            if [ "$(/usr/bin/tmux display -p -t "$MONITOR_PANE" '#{pane_active}' 2>/dev/null)" = "0" ]; then
-                continue
-            fi
-            new_struct=$(bash -c "source $SCRIPT_DIR/helpers.sh && $SCRIPT_DIR/scanner.sh $SCOPE $CUR_SESSION" 2>/dev/null \
-                | jq -r '"\(.target):\(.status)"' 2>/dev/null | sort)
-            cycle=$((cycle + 1))
-            if [ "$new_struct" != "$last_struct" ] || [ $((cycle % 5)) -eq 0 ]; then
-                [ "$new_struct" != "$last_struct" ] && last_struct="$new_struct"
-                body="reload($RELOAD_CMD)"
-                exec 3<>/dev/tcp/127.0.0.1/$FZF_PORT 2>/dev/null || continue
-                printf 'POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\n\r\n%s' \
-                    "${#body}" "$body" >&3
-                exec 3>&-
-            fi
-        done
-    ) &
-    RELOAD_PID=$!
-    trap "kill $RELOAD_PID 2>/dev/null" EXIT
+    while true; do
+        sleep "$INTERVAL"
+        active=$(t display-message -t "$MONITOR_PANE" -p '#{pane_active}' 2>/dev/null || echo "0")
+        if [ "$active" = "1" ]; then
+            reload_cmd="reload($REFRESH_SCRIPT '$SCOPE' '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')"
+            printf '%s\n' "$reload_cmd" | socat - "UNIX-CONNECT:$FZF_SOCK" 2>/dev/null || true
+        fi
+    done
+) &
+RELOAD_LOOP_PID=$!
 
-    HEADER="$(printf '\033[2m%-15s%-8s%-35s%8s %s\033[0m' 'STATUS' 'AGENT' 'CWD' 'UPTIME' 'SUMMARY')"
+# ── Cleanup ─────────────────────────────────────────────
 
-    echo "$INIT_DATA" | fzf \
-        --header="$HEADER" \
-        --listen="127.0.0.1:$FZF_PORT" \
-        --delimiter=$'\t' \
-        --with-nth=1 \
-        --id-nth=2 \
-        --track \
-        --preview "$SCRIPT_DIR/preview.sh {3}" \
-        --preview-window "down:80%:wrap" \
-        --bind "enter:execute($SCRIPT_DIR/switch.sh \$(echo {3} | jq -r .target))+abort" \
-        --bind "esc:abort" \
-        --bind "ctrl-r:reload($RELOAD_CMD)" \
-        --ansi \
-        --layout=reverse \
-        $FZF_EXTRA
-)
+cleanup() {
+    # Kill reload loop
+    [ -n "${RELOAD_LOOP_PID:-}" ] && kill "$RELOAD_LOOP_PID" 2>/dev/null || true
+    # Kill monitor window by its saved ID (not current — switch-client may have moved us)
+    if [ -n "${MONITOR_WINDOW:-}" ]; then
+        t kill-window -t "$MONITOR_WINDOW" 2>/dev/null || true
+    fi
+    # Clean up state directory
+    rm -rf "$STATE_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# ── Launch fzf ──────────────────────────────────────────
+
+fzf \
+    --listen="$FZF_SOCK" \
+    --delimiter=$'\t' \
+    --with-nth=2 \
+    --id-nth=1 \
+    --track \
+    --header='STATUS          AGENT    CWD                                UPTIME   SUMMARY' \
+    --bind "focus:execute-silent(echo {1} > $STATE_DIR/current; echo 0 > $STATE_DIR/offset_x; echo 0 > $STATE_DIR/offset_y)" \
+    --bind "load:reload(sleep 0.5; $REFRESH_SCRIPT $SCOPE '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')" \
+    --bind "ctrl-r:reload($REFRESH_SCRIPT $SCOPE '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')" \
+    --bind "shift-up:execute-silent(y=\$(cat $STATE_DIR/offset_y 2>/dev/null || echo 0); echo \$((y + ${SCROLL_STEP})) > $STATE_DIR/offset_y)" \
+    --bind "shift-down:execute-silent(y=\$(cat $STATE_DIR/offset_y 2>/dev/null || echo 0); if [ \$y -ge ${SCROLL_STEP} ]; then echo \$((y - ${SCROLL_STEP})) > $STATE_DIR/offset_y; else echo 0 > $STATE_DIR/offset_y; fi)" \
+    --bind "shift-right:execute-silent(x=\$(cat $STATE_DIR/offset_x 2>/dev/null || echo 0); echo \$((x + ${SCROLL_STEP})) > $STATE_DIR/offset_x)" \
+    --bind "shift-left:execute-silent(x=\$(cat $STATE_DIR/offset_x 2>/dev/null || echo 0); if [ \$x -ge ${SCROLL_STEP} ]; then echo \$((x - ${SCROLL_STEP})) > $STATE_DIR/offset_x; else echo 0 > $STATE_DIR/offset_x; fi)" \
+    --bind "enter:execute($SCRIPT_DIR/switch.sh {1})+abort" \
+    --bind "esc:abort" \
+    --layout=reverse \
+    --ansi \
+    $FZF_ARGS \
+    <<< "$INITIAL_DATA"
+
+exit 0

@@ -1,22 +1,32 @@
 #!/usr/bin/env bash
-# Shared functions for tmux-agent-monitor
+# helpers.sh — Shared functions for tmux-agent-monitor
 set -euo pipefail
 
-# Read a @agent-monitor-* option with a default value
+TMUX_BIN="${TMUX_BIN:-/usr/bin/tmux}"
+# Respect a non-default tmux socket (e.g. TMUX_SOCKET from oh-my-tmux).
+# tmuxsocket_args expands to `-S <path>` when TMUX_SOCKET is set, else empty.
+if [ -n "${TMUX_SOCKET:-}" ]; then
+    TMUX_SOCKET_ARGS=(-S "$TMUX_SOCKET")
+else
+    TMUX_SOCKET_ARGS=()
+fi
+# Wrapper that always targets the correct socket.
+t() { "$TMUX_BIN" "${TMUX_SOCKET_ARGS[@]}" "$@"; }
+SESSIONS_DIR="$HOME/.claude/sessions"
+
+# ── Config ──────────────────────────────────────────────
+
 get_opt() {
     local name="$1" default="$2"
     local val
-    val="$(/usr/bin/tmux show-option -gqv "$name" 2>/dev/null)"
+    val="$(t show-option -gqv "$name" 2>/dev/null)"
     echo "${val:-$default}"
 }
 
-# Check required dependencies, exit with error if missing
 require_deps() {
     local missing=()
-    for dep in fzf jq; do
-        if ! command -v "$dep" &>/dev/null; then
-            missing+=("$dep")
-        fi
+    for dep in fzf jq perl socat; do
+        command -v "$dep" &>/dev/null || missing+=("$dep")
     done
     if [ ${#missing[@]} -gt 0 ]; then
         echo "ERROR: tmux-agent-monitor requires: ${missing[*]}" >&2
@@ -25,112 +35,180 @@ require_deps() {
     fi
 }
 
-# Read a session status file and extract fields
-# Returns empty string if file doesn't exist or pid is dead
-read_session() {
+# ── PID → Pane ──────────────────────────────────────────
+
+pane_id_from_pid() {
     local pid="$1"
-    local key="$2"
-    local file="$HOME/.claude/sessions/${pid}.json"
-    if [ ! -f "$file" ]; then
-        echo ""
-        return
-    fi
-    jq -r ".${key} // empty" "$file" 2>/dev/null
+    local pane_id
+    pane_id=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+        | awk -F= '$1=="TMUX_PANE"{print $2; exit}')
+    echo "$pane_id"
 }
 
-# Check if a process is alive
-is_alive() {
-    local pid="$1"
-    kill -0 "$pid" 2>/dev/null
-}
-
-# Walk the parent PID chain from a given pid upward,
-# match against /usr/bin/tmux pane_pid list, return the matching
-# pane_pid or empty string if not found.
 find_pane_pid() {
-    local pid="$1"
-    local cur="$pid"
+    local pid="$1" cur="$pid"
     local pane_pids
-    pane_pids="$(/usr/bin/tmux list-panes -a -F '#{pane_pid}' 2>/dev/null)"
-
+    pane_pids="$(t list-panes -a -F '#{pane_pid}' 2>/dev/null)"
     while [ "$cur" -gt 1 ]; do
         if echo "$pane_pids" | grep -q "^${cur}$"; then
-            echo "$cur"
-            return 0
+            echo "$cur"; return 0
         fi
         local ppid
-        ppid=$(awk '/^PPid:/{print $2}' "/proc/${cur}/status" 2>/dev/null)
-        if [ -z "$ppid" ] || [ "$ppid" = "$cur" ]; then
-            break
-        fi
+        ppid=$(awk '/^PPid:/{print $2}' "/proc/$cur/status" 2>/dev/null)
+        [ -z "$ppid" ] || [ "$ppid" = "$cur" ] && break
         cur="$ppid"
     done
     return 1
 }
 
-# Given a pane_pid, return the target string "session:window.pane"
-pane_pid_to_target() {
-    local pane_pid="$1"
-    /usr/bin/tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
-        | awk -v pid="$pane_pid" '$1 == pid {print $2; exit}'
+pane_id_to_target() {
+    local pane_id="$1"
+    t list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+        | awk -v id="$pane_id" '$1==id{print $2; exit}'
 }
 
-# Strip ANSI escape sequences and control characters from stdin
+pane_id_to_session() {
+    local pane_id="$1"
+    t display-message -t "$pane_id" -p '#{session_name}' 2>/dev/null
+}
+
+pane_dims() {
+    local pane_id="$1"
+    t display-message -t "$pane_id" -p '#{pane_width} #{pane_height}' 2>/dev/null
+}
+
+# ── Process check ───────────────────────────────────────
+
+is_alive() { kill -0 "$1" 2>/dev/null; }
+
+# ── Text helpers ────────────────────────────────────────
+
 strip_ansi() {
-    sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\000-\010\013-\037' | sed '/^$/d'
+    sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\][0-9]+;[^[:cntrl:]]*(\x07|\x1b\\)//g' \
+        | tr -d '\000-\010\013-\037' \
+        | sed '/^$/d'
 }
 
-# Human-readable uptime from seconds
 format_uptime() {
     local secs="$1"
-    local m=$((secs / 60))
+    if [ "$secs" -lt 0 ]; then secs=0; fi
+    local h=$((secs / 3600))
+    local m=$(((secs % 3600) / 60))
     local s=$((secs % 60))
-    if [ "$m" -gt 0 ]; then
+    if [ "$h" -gt 0 ]; then
+        printf "%dh%dm" "$h" "$m"
+    elif [ "$m" -gt 0 ]; then
         printf "%dm%ds" "$m" "$s"
     else
         printf "%ds" "$s"
     fi
 }
 
-# Format a JSON line into: display + TAB + target + TAB + raw JSON (for fzf --track)
-# Column widths:  STATUS=15  AGENT=8  CWD=35  UPTIME=8  SUMMARY=rest
+# ANSI-aware horizontal crop with UTF-8 support.
+#   ansi_crop <offset_x> <max_width>  — reads stdin, writes stdout
+# offset_x: number of visible chars to skip from the left of each line.
+# max_width: number of visible chars to keep after skipping.
+# Preserves ANSI SGR sequences; handles multi-byte UTF-8 characters correctly.
+ansi_crop() {
+    local skip="$1" width="$2"
+    perl -CS -e '
+        my ($skip, $width) = @ARGV;
+        while (<STDIN>) {
+            chomp;
+            my $visible = 0;
+            my $out = "";
+            my @sgr = ();          # active SGR stack
+            my $emitted_prefix = 0;
+
+            while (length($_)) {
+                # ── ANSI CSI sequence ──
+                if (s/^(\e\[[0-9;]*[a-zA-Z])//) {
+                    my $seq = $1;
+                    my $final = substr($seq, -1, 1);
+                    my $in_range = ($visible >= $skip && $visible < $skip + $width);
+                    if ($final eq "m") {
+                        # SGR: track state, include in output if in range
+                        my $code = $seq; $code =~ s/^\e\[//; $code =~ s/m$//;
+                        if ($code eq "0" || $code eq "") { @sgr = (); }
+                        else { push @sgr, $seq; }
+                        $out .= $seq if $in_range;
+                    }
+                    # Non-SGR CSI — silently dropped (no meaning in snapshot)
+                    next;
+                }
+                # ── UTF-8 character (may be multi-byte) ──
+                s/^(\X)//;
+                my $c = $1;
+                $visible++;
+                next if $visible <= $skip;
+                last if $visible > $skip + $width;
+
+                # First visible char: re-emit SGR state
+                if (!$emitted_prefix && $skip > 0 && @sgr) {
+                    $out .= "\e[0m" . join("", @sgr);
+                    $emitted_prefix = 1;
+                }
+                $out .= $c;
+            }
+            # Always close with SGR reset
+            $out .= "\e[0m" if length($out);
+            print "$out\n";
+        }
+    ' "$skip" "$width"
+}
+
+# ── State directory ─────────────────────────────────────
+
+STATE_DIR="${STATE_DIR:-/tmp/agent-monitor-$$}"
+ensure_state_dir() { mkdir -p "$STATE_DIR" 2>/dev/null; }
+export STATE_DIR
+
+# ── NDJSON → fzf display ───────────────────────────────
+
 format_stream() {
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        local status=$(echo "$line" | jq -r '.status // "?"')
-        local agent=$(echo "$line" | jq -r '.agent // "?"')
-        local cwd_raw=$(echo "$line" | jq -r '.cwd // "?"')
-        local uptime=$(echo "$line" | jq -r '.uptime // "?"')
-        local summary=$(echo "$line" | jq -r '.summary // ""')
-        local target=$(echo "$line" | jq -r '.target // ""')
+        local pane_id st agent cwd uptime summary target
+        pane_id=$(echo "$line" | jq -r '.pane_id // "?"')
+        st=$(echo "$line" | jq -r '.status // "?"')
+        agent=$(echo "$line" | jq -r '.agent // "?"')
+        cwd=$(echo "$line" | jq -r '.cwd // "?"')
+        uptime=$(echo "$line" | jq -r '.uptime // "?"')
+        summary=$(echo "$line" | jq -r '.summary // ""')
+        target=$(echo "$line" | jq -r '.target // ""')
 
-        local color
-        case "$status" in
-            busy)      color="33" ;;
-            idle)      color="32" ;;
-            waiting*)  color="35" ;;
-            *)         color="37" ;;
-        esac
-
-        # Truncate cwd from left if too long: show last 34 chars with "…" prefix
-        local cwd="$cwd_raw"
-        if [ "${#cwd}" -gt 35 ]; then
-            cwd=">${cwd: -34}"
+        # Handle empty placeholder line
+        if [ "$st" = "__empty__" ]; then
+            printf "__empty__\t\033[2m  %s\033[0m\t%s\n" "$summary" "$line"
+            continue
         fi
 
-        # Pad columns FIRST (plain text), then apply ANSI colors
-        local status_col agent_col cwd_col uptime_col
-        status_col=$(printf '%-15s' "$status")
+        local color
+        case "$st" in
+            busy)      color="33" ;;  # yellow
+            idle)      color="32" ;;  # green
+            waiting*)  color="35" ;;  # magenta
+            *)         color="37" ;;  # white
+        esac
+
+        local cwd_disp="$cwd"
+        if [ "${#cwd_disp}" -gt 35 ]; then
+            cwd_disp="…${cwd_disp: -34}"
+        fi
+
+        local st_col agent_col cwd_col uptime_col
+        st_col=$(printf '%-15s' "$st")
         agent_col=$(printf '%-8s' "$agent")
-        cwd_col=$(printf '%-35s' "$cwd")
+        cwd_col=$(printf '%-35s' "$cwd_disp")
         uptime_col=$(printf '%8s' "$uptime")
 
-        printf "\033[1;${color}m%s\033[0m" "$status_col"
+        # Output: pane_id \t display \t json_line
+        printf "%s\t" "$pane_id"
+        printf "\033[1;${color}m%s\033[0m" "$st_col"
         printf "%s" "$agent_col"
         printf "%s" "$cwd_col"
         printf "\033[2m%s\033[0m" "$uptime_col"
         printf " %s" "$summary"
-        # hidden fields: target + JSON for fzf
-        printf "\t%s\t%s\n" "$target" "$line"
+        printf "\t%s\n" "$line"
     done
 }

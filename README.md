@@ -4,12 +4,12 @@ Monitor Claude AI agents running across tmux panes — real-time status, live pr
 
 ## Requirements
 
-- tmux >= 3.0
-- fzf >= 0.48 (for `--listen` HTTP API)
-- jq
+- tmux >= 3.2 (for `split-window -PF`)
+- fzf >= 0.48 (for `--listen` Unix socket API)
+- jq, perl, socat
 
 ```bash
-sudo apt install fzf jq
+sudo apt install fzf jq perl socat
 ```
 
 ## Install (TPM)
