@@ -65,6 +65,13 @@ PREVIEW_PANE=$(t split-window $SPLIT_FLAG -p "$PREVIEW_RATIO" -PF '#{pane_id}' \
 
 REFRESH_SCRIPT="$SCRIPT_DIR/refresh-feed.sh"
 
+# Return focus to fzf pane BEFORE the initial data load.
+# split-window gave focus to the preview pane, so the monitor pane is currently
+# inactive — refresh-feed.sh's visibility guard would see pane_active=0 and return
+# empty data, leaving STATE_DIR/current blank and the preview stuck on the
+# "select an agent" placeholder. Restoring focus first keeps the guard happy.
+t select-pane -t "$MONITOR_PANE" 2>/dev/null || true
+
 # Initial data
 INITIAL_DATA=$("$REFRESH_SCRIPT" "$SCOPE" "$SESSION_NAME" "$MONITOR_PANE" 2>/dev/null || true)
 
@@ -73,9 +80,6 @@ FIRST_PANE_ID=$(echo "$INITIAL_DATA" | grep -v '__empty__' | head -1 | cut -f1 2
 if [ -n "$FIRST_PANE_ID" ] && [ "$FIRST_PANE_ID" != "__empty__" ]; then
     echo "$FIRST_PANE_ID" > "$STATE_DIR/current"
 fi
-
-# Return focus to fzf pane (split-window gave it to preview)
-t select-pane -t "$MONITOR_PANE" 2>/dev/null || true
 
 # ── Periodic refresh via fzf --listen Unix socket ───────
 
@@ -118,7 +122,7 @@ fzf \
     --track \
     --header='STATUS          AGENT    CWD                                UPTIME   SUMMARY' \
     --bind "focus:execute-silent(echo {1} > $STATE_DIR/current; echo 0 > $STATE_DIR/offset_x; echo 0 > $STATE_DIR/offset_y)" \
-    --bind "load:reload(sleep 0.5; $REFRESH_SCRIPT $SCOPE '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')" \
+    --bind "load:execute-silent([ -s $STATE_DIR/current ] || echo {1} > $STATE_DIR/current)+reload(sleep 0.5; $REFRESH_SCRIPT $SCOPE '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')" \
     --bind "ctrl-r:reload($REFRESH_SCRIPT $SCOPE '${SESSION_NAME//\'/\'\\\'\'}' '${MONITOR_PANE//\'/\'\\\'\'}')" \
     --bind "shift-up:execute-silent(y=\$(cat $STATE_DIR/offset_y 2>/dev/null || echo 0); echo \$((y + ${SCROLL_STEP})) > $STATE_DIR/offset_y)" \
     --bind "shift-down:execute-silent(y=\$(cat $STATE_DIR/offset_y 2>/dev/null || echo 0); if [ \$y -ge ${SCROLL_STEP} ]; then echo \$((y - ${SCROLL_STEP})) > $STATE_DIR/offset_y; else echo 0 > $STATE_DIR/offset_y; fi)" \
