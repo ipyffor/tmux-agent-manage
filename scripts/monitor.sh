@@ -100,7 +100,10 @@ RELOAD_LOOP_PID=$!
 
 # ── Cleanup ─────────────────────────────────────────────
 
+BIND_TAG="agent-monitor-$$"
 cleanup() {
+    # Remove tmux scroll bindings (scoped by tag)
+    [ -n "${BIND_TAG:-}" ] && t unbind-key -T root -N "$BIND_TAG" 2>/dev/null || true
     # Kill reload loop
     [ -n "${RELOAD_LOOP_PID:-}" ] && kill "$RELOAD_LOOP_PID" 2>/dev/null || true
     # Kill monitor window by its saved ID (not current — switch-client may have moved us)
@@ -109,8 +112,32 @@ cleanup() {
     fi
     # Clean up state directory
     rm -rf "$STATE_DIR" 2>/dev/null || true
+    # Clean up bindings cache
+    rm -f "$HOME/.cache/agent-monitor-dir" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+
+# ── Tmux scroll bindings ───────────────────────────────
+
+# Shift+Up/Down may not reach fzf's key handler in all terminal/tmux
+# configurations.  Register them directly as tmux root bindings scoped by tag
+# so they work regardless of fzf key delivery.  Only fire when the current
+# window name matches "agent-monitor".  Non-matching windows get the key
+# forwarded so other apps are not affected.
+#
+# Save STATE_DIR so that external helpers (e.g. test scripts, keybindings)
+# can find it without scanning /tmp.
+mkdir -p "$HOME/.cache"
+echo "$STATE_DIR" > "$HOME/.cache/agent-monitor-dir"
+
+t bind-key -N "$BIND_TAG" -T root S-Up \
+    if-shell -F '#{==:#{window_name},agent-monitor}' \
+    "run-shell 'y=\$(cat $STATE_DIR/offset_y 2>/dev/null || echo 0); echo \$((y + $SCROLL_STEP)) > $STATE_DIR/offset_y'" \
+    "send-keys -t #{pane_id} S-Up"
+t bind-key -N "$BIND_TAG" -T root S-Down \
+    if-shell -F '#{==:#{window_name},agent-monitor}' \
+    "run-shell 'y=\$(cat $STATE_DIR/offset_y 2>/dev/null || echo 0); if [ \$y -ge $SCROLL_STEP ]; then echo \$((y - $SCROLL_STEP)) > $STATE_DIR/offset_y; else echo 0 > $STATE_DIR/offset_y; fi'" \
+    "send-keys -t #{pane_id} S-Down"
 
 # ── Launch fzf ──────────────────────────────────────────
 
